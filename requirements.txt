@@ -1,4 +1,5 @@
 # Everything runs on the Python 3.9+ standard library.
 # Optional extras (the tracker runs without them):
 segno            # phone-pairing QR code
+opencv-python-headless  # Magic: reads the collector number in the card corner
 # cactus-needle  # assistant bubble — pip install cactus-needle

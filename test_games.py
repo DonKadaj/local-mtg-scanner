@@ -36,6 +36,18 @@ def test_parse_print_info():
         lines(("Sol Ring", 0.95), ("TLE \u2022 EN", 0.05), ("0026", 0.03)), "mtg")
     assert (sc, num) == ("tle", "26"), (sc, num)
 
+    # Magic foil star read as "*+" and junk after the number (real OCR output)
+    sc, num = server.parse_print_info(
+        lines(("HOB*+FR %@\u00ae Marius BoTA", 0.01), ("R 0297 < \u00a9 MEE", 0.03)), "mtg")
+    assert (sc, num) == ("hob", "297"), (sc, num)
+    sc, num = server.parse_print_info(
+        lines(("HOB \u2605FR", 0.01), ("L 0198", 0.03)), "mtg")
+    assert (sc, num) == ("hob", "198"), (sc, num)
+    # rules text near the bottom must not be taken for a collector number
+    sc, num = server.parse_print_info(
+        lines(("37 Vous vous \u00eates d\u00e9fauss\u00e9", 0.05), ("3/2", 0.04)), "mtg")
+    assert num is None, (sc, num)
+
     sc, num = server.parse_print_info(
         lines(("Pikachu", 0.95), ("189/165", 0.05)), "pokemon")
     assert num == "189", (sc, num)
@@ -79,7 +91,22 @@ def test_pokemon_summary():
     assert server.image_ok_any(s["image_uri"])
 
 
+def test_title_veto():
+    # set + number decide; the title only blocks when it names another card
+    st = server._state_for("mtg-test")
+    st["cards"] = [{"scryfall_id": "a", "name": "Ravenhill Flock"},
+                   {"scryfall_id": "b", "name": "Lightning Bolt"}]
+    st["exact"], st["byname"], st["byid"] = server._index_cards(st["cards"])
+    flock = st["cards"][0]
+    for title in ("Nu\u00e9e de Montcorbeau",   # French title: unknown name
+                  "ROO1S FFI",                   # unreadable title
+                  "Ravenhill Flock"):            # the right name
+        assert not server.title_contradicts(title, flock, "mtg-test"), title
+    assert server.title_contradicts("Lightning Bolt", flock, "mtg-test")
+
+
 if __name__ == "__main__":
+    test_title_veto()
     test_ygo_set_parts()
     test_parse_print_info()
     test_ygo_summary()

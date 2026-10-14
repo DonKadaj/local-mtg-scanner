@@ -58,6 +58,10 @@ except ImportError:
     deckbuilder = None
 
 try:
+    import card_vision  # optional Magic corner reader (pip install opencv-python-headless)
+except ImportError:
+    card_vision = None
+try:
     import assistant  # optional needle2 chat assistant (pip install cactus-needle)
 except ImportError:
     assistant = None
@@ -78,6 +82,12 @@ KEY_FILE = os.path.join(ROOT, "key.pem")
 # Request size caps: 12MB for photos/CSVs, 1MB for JSON.
 MAX_UPLOAD = 12 * 1024 * 1024
 MAX_JSON_BODY = 1024 * 1024
+
+# Optional: keep a copy of every /api/scan upload + its result, to build a
+# test set for tools/bench_scan.py. Off unless the env var names a folder.
+SAVE_SCANS_DIR = os.environ.get("CARD_TRACKER_SAVE_SCANS", "").strip()
+if SAVE_SCANS_DIR:
+    SAVE_SCANS_DIR = os.path.join(ROOT, SAVE_SCANS_DIR)  # relative → repo folder
 
 # Backups: snapshots of collection.db kept in backups/.
 BACKUP_DIR = os.path.join(ROOT, "backups")
@@ -1234,6 +1244,22 @@ def local_exact_match(set_code, number, game="mtg"):
     return got[0] if got else None
 
 
+def local_sets_with_number(number, game="mtg"):
+    """Set codes having a card with this collector number, newest set first."""
+    load_local(game)
+    st = _state_for(game)
+    if "sets_by_number" not in st:
+        by_num, released = {}, {}
+        for (set_code, num), cards in (st.get("exact") or {}).items():
+            by_num.setdefault(num, []).append(set_code)
+            released[set_code] = max(released.get(set_code, ""),
+                                     cards[0].get("released_at") or "")
+        for codes in by_num.values():  # newest first: ties go to recent sets
+            codes.sort(key=lambda s: released[s], reverse=True)
+        st["sets_by_number"] = by_num
+    return st["sets_by_number"].get(_norm_num(number), [])
+
+
 def local_name_match(name, game="mtg"):
     load_local(game)
     byname = _state_for(game).get("byname")
@@ -1405,6 +1431,7 @@ def download_localdb(game="mtg"):
             with _local_lock:
                 st["cards"] = cards
                 st["exact"], st["byname"], st["byid"] = _index_cards(cards)
+                st.pop("sets_by_number", None)  # rebuilt on next use
                 st["meta"] = {"downloaded_at": now_iso(),
                               "card_count": len(cards),
                               "source": prov.id}
@@ -1625,9 +1652,21 @@ def candidate_names(lines):
 # "TLE • EN • …" (set code + language), or Pokémon-style "189/165".
 NUM_RE = re.compile(r"^[CURMTS]?\s*0*(\d{1,4})(?:\s*/\s*\d+)?[a-z★]?$")
 SET_RE = re.compile(r"^([A-Z0-9]{3,5})\s*[•·.\-*+]\s*[A-Z]{2}\b")
+# Magic only: the foil star (★) is often OCR'd as "*", "*+" or "+", and the
+# rarity + number line often carries trailing junk ("R 0297 . © MEE").
+# Accept those when the line looks like a modern collector line: a rarity
+# letter before the number, or a zero-padded 4-digit number.
+MTG_SET_RE = re.compile(r"^([A-Z0-9]{3,5})\s*[•·.\-*+★☆]{1,3}\s*([A-Z]{2})\b")
+MTG_NUM_RE = re.compile(r"^(?:[CURMTSLP]\s*0*(\d{1,4})|0(\d{3}))(?![\d/])", re.I)
 # Yu-Gi-Oh! set codes like "FOTB-EN043", "SDK-007", "LON-E088".
 YGO_CODE_RE = re.compile(
     r"^([A-Za-z0-9]{2,6})[-\s–—.]*([A-Za-z]{0,3})?[-\s–—.]*0*(\d{1,4})$")
+
+
+def _is_power_toughness(text):
+    """Magic "3/2" power/toughness box, not an old-style "40/350" number."""
+    m = re.search(r"/\s*(\d+)", text)
+    return bool(m) and int(m.group(1)) < 20
 
 
 def parse_print_info(lines, game="mtg"):
@@ -1642,11 +1681,21 @@ def parse_print_info(lines, game="mtg"):
                 number = m.group(3)
                 continue
         m = NUM_RE.match(text)
+        if m and game == "mtg" and _is_power_toughness(text):
+            m = None
         if m and number is None:
             number = m.group(1)
+        if game == "mtg" and number is None:
+            m = MTG_NUM_RE.match(text)
+            if m:
+                number = m.group(1) or m.group(2)
         m = SET_RE.match(text)
         if m and set_code is None:
             set_code = m.group(1).lower()
+        if game == "mtg" and set_code is None:
+            m = MTG_SET_RE.match(text)
+            if m:
+                set_code = m.group(1).lower()
         if number and set_code:
             break
     return set_code, number
@@ -1657,6 +1706,17 @@ def names_agree(a, b):
     norm = lambda s: re.sub(r"[^a-z]", "", s.lower())
     na, nb = norm(a), norm(b.split("//")[0])
     return na in nb or nb in na or _similar(na, nb) > 0.7
+
+
+def title_contradicts(title, card, game="mtg"):
+    """True when the OCR'd title clearly names another card.
+
+    Set + number decide the printing; the title only vetoes it. A title that
+    is unreadable, or in a language the offline index doesn't know (e.g. a
+    French card), matches no card name and so doesn't block anything.
+    """
+    other = local_name_match(title, game)
+    return other is not None and not names_agree(other["name"], card["name"])
 
 
 def _similar(a, b):
@@ -1670,6 +1730,21 @@ def identify_card(image_path, game="mtg"):
     lines = ocr_image(image_path)
     names = candidate_names(lines)
     set_code, number = parse_print_info(lines, game)
+    lang = None
+    # Magic: the whole-photo OCR often misses or garbles the small collector
+    # line, so read the card's bottom-left corner on its own (needs OpenCV).
+    # Its reading is checked against the card index, so it wins when complete.
+    if game == "mtg" and card_vision is not None:
+        try:
+            v_set, v_num, lang = card_vision.read_collector_line(
+                image_path, lambda n: local_sets_with_number(n, game), TESS_LANGS)
+        except Exception:
+            v_set = v_num = None
+        if v_set and v_num:
+            set_code, number = v_set, v_num
+        elif v_num and not number:
+            number = v_num
+    read = {"set": set_code, "number": number, "lang": lang}
 
     # 1) Exact printing first: set code + collector number is unambiguous.
     if set_code and number:
@@ -1682,11 +1757,12 @@ def identify_card(image_path, game="mtg"):
                 card = None
             if card:
                 method, source = "exact", "api"
-        if card and (not names or names_agree(names[0], card["name"])):
+        if card and (not names or names_agree(names[0], card["name"])
+                     or (game == "mtg" and not title_contradicts(names[0], card, game))):
             return {"match": card, "method": method, "source": source,
                     "exact": True,
                     "ocr_guess": names[0] if names else card["name"],
-                    "ocr_candidates": names}
+                    "ocr_candidates": names, "read": read}
 
     # 2) Collector number without a set code (e.g. Pokémon "189/165") —
     #     match name + number across printings. Still an exact printing.
@@ -1696,7 +1772,7 @@ def identify_card(image_path, game="mtg"):
             if got and (len(got) == 1 or names_agree(names[0], got[0]["name"])):
                 return {"match": got[0], "method": "local-number", "source": "local",
                         "exact": True,
-                        "ocr_guess": name, "ocr_candidates": names}
+                        "ocr_guess": name, "ocr_candidates": names, "read": read}
             if prov.has_api:
                 try:
                     got = prov.search_numbered(name, number)
@@ -1705,7 +1781,7 @@ def identify_card(image_path, game="mtg"):
                 if got and (len(got) == 1 or names_agree(names[0], got[0]["name"])):
                     return {"match": got[0], "method": "number", "source": "api",
                             "exact": True,
-                            "ocr_guess": name, "ocr_candidates": names}
+                            "ocr_guess": name, "ocr_candidates": names, "read": read}
 
     # 3) Fall back to fuzzy name match (NOT an exact printing).
     for name in names[:4]:
@@ -1713,7 +1789,7 @@ def identify_card(image_path, game="mtg"):
         if card:
             return {"match": card, "method": "local-name", "source": "local",
                     "exact": False,
-                    "ocr_guess": name, "ocr_candidates": names}
+                    "ocr_guess": name, "ocr_candidates": names, "read": read}
         if prov.has_api:
             try:
                 card = prov.name_lookup(name)
@@ -1722,9 +1798,22 @@ def identify_card(image_path, game="mtg"):
             if card:
                 return {"match": card, "method": "fuzzy", "source": "api",
                         "exact": False,
-                        "ocr_guess": name, "ocr_candidates": names}
+                        "ocr_guess": name, "ocr_candidates": names, "read": read}
     return {"match": None, "method": None, "source": None, "exact": False,
-            "ocr_guess": names[0] if names else None, "ocr_candidates": names}
+            "ocr_guess": names[0] if names else None, "ocr_candidates": names, "read": read}
+
+
+def save_scan(data, suffix, result):
+    """Store a scan upload and its result side by side (CARD_TRACKER_SAVE_SCANS)."""
+    try:
+        os.makedirs(SAVE_SCANS_DIR, exist_ok=True)
+        base = os.path.join(SAVE_SCANS_DIR, "scan-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+        with open(base + suffix, "wb") as f:
+            f.write(data)
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass  # never break a scan because the copy failed
 
 
 # ---------------------------------------------------------------- handlers
@@ -2224,6 +2313,8 @@ class Handler(BaseHTTPRequestHandler):
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             result = identify_card(tmp, game)
+            if SAVE_SCANS_DIR:
+                save_scan(data, suffix, result)
         finally:
             os.unlink(tmp)
         if result.get("match"):
