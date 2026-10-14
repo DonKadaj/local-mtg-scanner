@@ -25,6 +25,10 @@ __pycache__/
 # recognition test photos + results (tools/bench_scan.py)
 test_cards/
 
+# personal project notes (kept local, not published)
+/CLAUDE.md
+docs/IDEAS.md
+
 # misc
 .DS_Store
 .claude/
