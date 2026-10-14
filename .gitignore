@@ -22,6 +22,9 @@ segno/
 __pycache__/
 *.pyc
 
+# recognition test photos + results (tools/bench_scan.py)
+test_cards/
+
 # misc
 .DS_Store
 .claude/
