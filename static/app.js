@@ -1083,22 +1083,26 @@ async function refreshLocaldb() {
     const st = await fetch(withGame("/api/localdb")).then((r) => r.json());
     const btn = $("localdb-btn");
     btn.disabled = !!st.downloading;
+    renderLocaldbLangs(st);
     if (st.downloading) {
       // downloading → keep the full box visible with progress
       box.classList.remove("hidden");
       chip.classList.add("hidden");
       btn.textContent = "…";
       $("localdb-status").textContent =
-        st.phase === "build" ? "Building local index…" : "Downloading…";
+        st.phase === "build" ? "Building local index…" :
+        st.phase === "names" ? "Downloading card names…" : "Downloading…";
       updateLocaldbBar(st);
     } else if (st.available) {
       // downloaded → collapse into the small chip next to Prices
       box.classList.add("hidden");
       chip.classList.remove("hidden");
       btn.textContent = "Update";
+      $("localdb-status").textContent = `${(st.card_count || 0).toLocaleString()} cards offline`;
       const label = chip.querySelector(".btn-label");
       if (label) label.textContent = "Offline";
       chip.title = `${(st.card_count || 0).toLocaleString()} cards offline` +
+        ` · ${["EN", ...(st.langs || []).map((l) => l.toUpperCase())].join(" ")}` +
         (st.downloaded_at ? ` · ${st.downloaded_at.slice(0, 10)} — click to update` : " — click to update");
     } else {
       // not downloaded yet → full prompt stays visible
@@ -1113,10 +1117,31 @@ async function refreshLocaldb() {
   }
 }
 
+// Magic: languages whose printed card names are downloaded with the offline
+// database (checkboxes — a collection can mix languages). English is always in.
+function renderLocaldbLangs(st) {
+  const box = $("localdb-langs");
+  const langs = st.name_langs || [];
+  box.classList.toggle("hidden", !langs.length);
+  if (!langs.length || box.dataset.ready) return;
+  box.dataset.ready = "1";
+  const chosen = new Set(st.langs || []);
+  box.innerHTML = `<label><input type="checkbox" checked disabled> EN</label>` +
+    langs.map((l) => `<label><input type="checkbox" value="${l}"${chosen.has(l) ? " checked" : ""}> ${l.toUpperCase()}</label>`).join("");
+}
+
 function updateLocaldbBar(st) {
   const wrap = $("localdb-bar-wrap");
   wrap.classList.remove("hidden");
   const bar = $("localdb-bar");
+  if (st.phase === "names") {
+    bar.classList.remove("indeterminate");
+    bar.style.width = (st.total ? Math.min(100, (st.done / st.total) * 100) : 0) + "%";
+    $("localdb-status").textContent = st.label === "flavor"
+      ? "Downloading flavor names…"
+      : `Downloading ${String(st.label).toUpperCase()} names ${(st.done || 0).toLocaleString()}/${(st.total || 0).toLocaleString()}`;
+    return;
+  }
   if (st.total_mb) {
     bar.classList.remove("indeterminate");
     bar.style.width = Math.min(100, ((st.done_mb || 0) / st.total_mb) * 100) + "%";
@@ -1129,7 +1154,12 @@ function updateLocaldbBar(st) {
 }
 
 $("localdb-btn").onclick = async () => {
-  const resp = await fetch(withGame("/api/localdb/download"), { method: "POST" });
+  const langs = [...document.querySelectorAll("#localdb-langs input[value]:checked")].map((i) => i.value);
+  const resp = await fetch(withGame("/api/localdb/download"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ langs }),
+  });
   if (!resp.ok) toast("Download already running", 3000);
   refreshLocaldb();
 };

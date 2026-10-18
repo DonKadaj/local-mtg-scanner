@@ -253,6 +253,8 @@ button .ic + .btn-label, label .ic + .btn-label { margin-left: 2px; }
 .localdb-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
 .localdb.ready .localdb-dot { background: var(--ok); }
 .localdb-status { color: var(--text-dim); }
+.localdb-langs { display: flex; flex-wrap: wrap; gap: 2px 8px; color: var(--text-dim); }
+.localdb-langs label { display: inline-flex; align-items: center; gap: 3px; font: 400 11px/1 var(--font-mono); }
 #localdb-bar-wrap { height: 4px; background: rgba(233,233,237,.08); border-radius: 2px;
   overflow: hidden; min-width: 60px; flex: 1; }
 #localdb-bar { height: 100%; width: 0; background: var(--ok); transition: width .3s; }
