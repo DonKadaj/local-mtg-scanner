@@ -42,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1182,8 +1183,14 @@ def _download_state_for(game):
     return st
 
 
+def fold_accents(s):
+    """"Forêt Noire" -> "Foret Noire": names compare without accents."""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s or "")
+                   if not unicodedata.combining(ch))
+
+
 def _norm_name(s):
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    return re.sub(r"[^a-z0-9]", "", fold_accents(s).lower())
 
 
 def _norm_num(n):
@@ -1638,6 +1645,29 @@ def ocr_image(path, attempts=2):
     raise last
 
 
+def clean_title(text):
+    """A title without the OCR noise around it.
+
+    Tesseract often adds stray symbols before or after the title ("| Gardienne
+    des salles |", "Gros ours 3"). Non-letters are trimmed at both
+    ends; accents, apostrophes, hyphens and commas inside are kept
+    ("L'Anneau unique", "Jace, ..."). Leftover one-letter words at the end
+    are mana or frame noise.
+    """
+    text = re.sub(r"\s+", " ", (text or "").replace("’", "'"))
+    start, end = 0, len(text)
+    while start < end and not text[start].isalpha():
+        start += 1
+    while end > start and not text[end - 1].isalpha():
+        end -= 1
+    text = text[start:end]
+    words = text.split(" ")
+    while len(words) > 1 and len(words[-1]) == 1:
+        words.pop()
+    text = " ".join(words).rstrip(" ,'-")
+    return text if sum(ch.isalpha() for ch in text) >= 2 else ""
+
+
 def candidate_names(lines):
     """Pick likely card-name lines: topmost text, mostly letters.
 
@@ -1652,8 +1682,7 @@ def candidate_names(lines):
             continue
         if letters < len(text) * 0.6:
             continue
-        # strip mana-cost artifacts sometimes OCR'd after the name
-        text = re.sub(r"[\d{}()*]+$", "", text).strip()
+        text = clean_title(text)
         if text:
             usable.append((ln["y"], ln.get("confidence", 0), text))
     usable.sort(key=lambda t: -t[0])  # topmost first
@@ -1720,7 +1749,7 @@ def parse_print_info(lines, game="mtg"):
 
 def names_agree(a, b):
     """Loose check that an exact-print hit matches the OCR'd title."""
-    norm = lambda s: re.sub(r"[^a-z]", "", s.lower())
+    norm = lambda s: re.sub(r"[^a-z]", "", fold_accents(s).lower())
     na, nb = norm(a), norm(b.split("//")[0])
     return na in nb or nb in na or _similar(na, nb) > 0.7
 
@@ -1776,6 +1805,14 @@ def identify_card(image_path, game="mtg"):
             set_code, number = v_set, v_num
         elif v_num and not number:
             number = v_num
+        # the title bar read on its own beats the topmost line of the photo,
+        # which is often a line of rules text
+        try:
+            title = clean_title(card_vision.read_title(image_path, TESS_LANGS))
+        except Exception:
+            title = ""
+        if title:
+            names = [title] + [n for n in names if n.lower() != title.lower()]
     read = {"set": set_code, "number": number, "lang": lang}
 
     # 1) Exact printing first: set code + collector number is unambiguous.

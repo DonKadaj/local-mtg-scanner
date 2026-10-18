@@ -9,6 +9,9 @@ in the photo, straighten it, cut the bottom strip, enlarge it and OCR that
 strip on its own. Several image variants are tried; a reading is accepted
 as soon as the set + number exist in the card database.
 
+The title is read the same way, from the title bar at the top of the card,
+so a line of rules text is no longer mistaken for the card name.
+
 Magic only: the strip position matches the Magic card frame.
 """
 import os
@@ -23,6 +26,10 @@ CARD_RATIO = 88 / 63  # height / width of a Magic card
 WARP_WIDTH = 1000
 # where the collector lines sit, as fractions of the card height
 STRIPS = ((0.905, 0.99), (0.925, 1.0), (0.885, 0.97))
+# the title bar (left of the mana cost), as fractions of the card size
+TITLE_BOX = (0.03, 0.11, 0.04, 0.82)  # top, bottom, left, right
+TITLE_MIN_CONF = 60  # mean Tesseract word confidence to trust a title
+TITLE_DROP_CONF = 40  # words below this at either end are glare or noise
 
 # Language codes printed after the set code ("HOB • FR", "HOB★FR").
 LANG_RE = re.compile(r"(?<![A-Z])(EN|FR|DE|IT|ES|PT|JA|JP|KO|RU|ZH|CS|CT|PH)(?![A-Z])")
@@ -81,16 +88,42 @@ def straighten(img, corners):
     return cv2.warpPerspective(img, m, (w, h))
 
 
-def _ocr(gray, tess_langs):
+def _ocr(gray, tess_langs, tsv=False):
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
         cv2.imwrite(path, gray)
-        out = subprocess.run(["tesseract", path, "stdout", "-l", tess_langs, "--psm", "6"],
-                             capture_output=True, text=True, timeout=30)
+        out = subprocess.run(["tesseract", path, "stdout", "-l", tess_langs, "--psm", "6"]
+                             + (["tsv"] if tsv else []),
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=30)
         return out.stdout
     finally:
         os.unlink(path)
+
+
+def _words(tsv_text):
+    """[(word, confidence)] from Tesseract TSV output."""
+    words = []
+    for ln in tsv_text.splitlines()[1:]:
+        cols = ln.split("\t")
+        if len(cols) == 12 and cols[11].strip():
+            try:
+                conf = float(cols[10])
+            except ValueError:
+                continue
+            if conf >= 0:
+                words.append((cols[11].strip(), conf))
+    return words
+
+
+def _card_image(image_path):
+    """The photo with the card straightened, or None if no card is found."""
+    img = cv2.imread(image_path)
+    if img is None:
+        return None, None
+    corners = find_card(img)
+    return img, (straighten(img, corners) if corners is not None else None)
 
 
 def _edit_distance(a, b):
@@ -158,11 +191,11 @@ def read_collector_line(image_path, sets_for_number, tess_langs="eng"):
     Returns (None, number, None) for an old card with no set code, and
     (None, None, None) when nothing usable is found.
     """
-    img = cv2.imread(image_path)
+    img, card = _card_image(image_path)
     if img is None:
         return None, None, None
-    corners = find_card(img)
-    card = straighten(img, corners) if corners is not None else img
+    if card is None:
+        card = img
     h, w = card.shape[:2]
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 8))
     variants = (  # white text on a black border → dark text on light
@@ -191,3 +224,47 @@ def read_collector_line(image_path, sets_for_number, tess_langs="eng"):
     # most votes first, then the least doubtful reading
     s, n = max(complete, key=lambda k: (votes[k][0], -votes[k][1]))
     return s, n, langs.get((s, n))
+
+
+
+def read_title(image_path, tess_langs="eng"):
+    """Card title read from the title bar, or None when unsure.
+
+    Needs the card outline: without it the title bar can't be located.
+    The bar is OCR'd in three image variants; the reading with the best
+    mean word confidence wins. Very low-confidence words at either end
+    (foil glare, the frame) are then dropped.
+    """
+    _, card = _card_image(image_path)
+    if card is None:
+        return None
+    h, w = card.shape[:2]
+    top, bottom, left, right = TITLE_BOX
+    bar = cv2.cvtColor(card[int(h * top):int(h * bottom), int(w * left):int(w * right)],
+                       cv2.COLOR_BGR2GRAY)
+    bar = cv2.resize(bar, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 8)).apply(bar)
+    variants = (bar, clahe, cv2.threshold(clahe, 0, 255,
+                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
+    best = None
+    for v in variants:
+        # words with letters; frame edges and mana symbols ("|", "(", "3\")
+        # are left out, clean_title() trims what remains of them
+        words = [(wd, c) for wd, c in _words(_ocr(v, tess_langs, tsv=True))
+                 if any(ch.isalpha() for ch in wd)]
+        if not words:
+            continue
+        conf = sum(c for _, c in words) / len(words)
+        while words and words[0][1] < TITLE_DROP_CONF:
+            words.pop(0)
+        while words and words[-1][1] < TITLE_DROP_CONF:
+            words.pop()
+        if words and (best is None or conf > best[0]):
+            best = (conf, words)
+    if not best or best[0] < TITLE_MIN_CONF:
+        return None
+    words = [wd for wd, _ in best[1]]
+    # "a M4 ry": scraps, not a name (the bar was not where we cut)
+    if sum(len(wd) for wd in words) / len(words) < 3:
+        return None
+    return " ".join(words)
