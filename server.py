@@ -98,6 +98,8 @@ BACKUP_KEEP = 14
 IMG_CACHE_DIR = os.path.join(ROOT, "img_cache")
 LOCAL_CARDS_FILE = os.path.join(ROOT, "local_cards.json")  # trimmed index
 LOCAL_META_FILE = os.path.join(ROOT, "localdb_meta.json")
+# Magic only: printed names of non-English printings + English flavor names
+LOCAL_NAMES_FILE = os.path.join(ROOT, "local_names.json")
 
 db_lock = threading.Lock()
 
@@ -329,12 +331,15 @@ class Provider:
         self._throttle()
         req = urllib.request.Request(url, headers={
             "User-Agent": "LocalCardTracker/1.0 (personal collection tool)",
-            "Accept": "application/json"})
+            "Accept": "application/json", "Accept-Encoding": "gzip"})
         last = None
         for attempt in range(retries + 1):
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    return json.loads(resp.read())
+                    body = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip":
+                        body = gzip.decompress(body)
+                    return json.loads(body)
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     return None
@@ -1290,6 +1295,8 @@ def local_name_match(name, game="mtg"):
     if not byname:
         return None
     cands = byname.get(_norm_name(name.split("//")[0].strip()))
+    if not cands and game == "mtg":
+        cands = printed_name_cards(name)
     if not cands:
         return None
     cands.sort(key=lambda c: c.get("released_at") or "", reverse=True)
@@ -1309,8 +1316,10 @@ def local_numbered_names(name, number, game="mtg"):
     if not byname:
         return []
     nn = _norm_num(number)
-    got = [c for c in byname.get(_norm_name(name.split("//")[0].strip()), [])
-           if _norm_num(c.get("collector_number", "")) == nn]
+    cands = byname.get(_norm_name(name.split("//")[0].strip()), [])
+    if not cands and game == "mtg":
+        cands = printed_name_cards(name)
+    got = [c for c in cands if _norm_num(c.get("collector_number", "")) == nn]
     got.sort(key=lambda c: c.get("released_at") or "", reverse=True)
     return got
 
@@ -1416,8 +1425,11 @@ def _write_index(lines, out_tmp, progress, decode=False, game="mtg"):
     return count
 
 
-def download_localdb(game="mtg"):
-    """Build the local card index for one game (background)."""
+def download_localdb(game="mtg", langs=None):
+    """Build the local card index for one game (background).
+
+    Magic: langs (e.g. ["fr"]) also fetches those languages' printed names.
+    """
     game = (game or "mtg").lower()
 
     def work():
@@ -1462,6 +1474,13 @@ def download_localdb(game="mtg"):
             os.replace(out_tmp, cards_file)
             with open(meta_file, "w") as f:
                 json.dump(st["meta"], f)
+            if game == "mtg" and langs is not None:
+                dstate["phase"] = "names"
+                def names_progress(label, done, total):
+                    broadcast({"type": "localdb-progress", "game": game,
+                               "phase": "names", "label": label,
+                               "done": done, "total": total})
+                download_names(langs, names_progress)
             broadcast({"type": "localdb-done", "game": game,
                        "card_count": len(cards)})
         except Exception as e:
@@ -1475,6 +1494,99 @@ def download_localdb(game="mtg"):
                 dstate.update(active=False, phase="", done_mb=0.0,
                               total_mb=0.0, cards=0)
     threading.Thread(target=work, daemon=True).start()
+
+
+# ------------------------------------------------- printed names (Magic)
+# The offline index holds English printings only. A French card's title
+# ("Nuée de Montcorbeau") and a flavor name printed instead of the real
+# one ("Princess Sarah" for Azusa, Lost but Seeking) are kept apart, keyed
+# by set + collector number, which the English printing shares. Languages
+# are chosen at download; English (and its flavor names) is always there.
+# Fetched with the Scryfall search, one language at a time: lang:fr is
+# ~60,000 printings, ~340 pages, ~30 MB gzipped, a few minutes.
+
+NAME_LANGS = ("fr", "de", "it", "es", "pt", "ja", "ko", "ru", "zhs", "zht")
+_names = {}  # loaded LOCAL_NAMES_FILE: langs, by_print, by_name
+
+
+def _load_names():
+    if "by_print" in _names:
+        return _names
+    by_print, by_name, langs, meta = {}, {}, [], None
+    try:
+        with open(LOCAL_NAMES_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+        langs, meta = doc.get("langs") or [], doc.get("downloaded_at")
+        for lang, set_code, num, name in doc.get("names") or []:
+            key = (set_code, _norm_num(num))
+            by_print.setdefault(key, {}).setdefault(lang, name)
+            for k in {_norm_name(name), _norm_name(name.split("//")[0])}:
+                by_name.setdefault(k, set()).add(key)
+    except (OSError, ValueError):
+        pass
+    _names.update(by_print=by_print, by_name=by_name, langs=langs,
+                  downloaded_at=meta)
+    return _names
+
+
+def printed_names(set_code, number, lang=None):
+    """Names printed on a printing: {lang: name}, one language if given."""
+    got = _load_names()["by_print"].get(
+        (str(set_code or "").lower(), _norm_num(number or "")), {})
+    if lang:
+        return {lang: got[lang]} if lang in got else {}
+    return dict(got)
+
+
+def printed_name_cards(name):
+    """English printings whose printed (foreign or flavor) name is this one."""
+    keys = _load_names()["by_name"].get(_norm_name(name.split("//")[0].strip()), ())
+    out = []
+    for set_code, num in sorted(keys):  # same order every run
+        c = local_exact_match(set_code, num)
+        if c:
+            out.append(c)
+    return out
+
+
+def _fetch_names(prov, query, lang, progress, label):
+    """[(lang, set, number, printed name)] for every printing matching query."""
+    out = []
+    d = prov.get_json("/cards/search", {"q": query, "unique": "prints",
+                                        "include_extras": "true",
+                                        "include_variations": "true"})
+    total = (d or {}).get("total_cards") or 0
+    while d:
+        for c in d.get("data", []):
+            if lang == "en":
+                name = c.get("flavor_name")
+            else:
+                faces = c.get("card_faces") or []
+                name = (" // ".join(f.get("printed_name") or f.get("name", "") for f in faces)
+                        if len(faces) > 1 and not c.get("printed_name")
+                        else c.get("printed_name"))
+            if name:
+                out.append((lang, c.get("set", ""), c.get("collector_number", ""), name))
+        progress(label, len(out), total)
+        nxt = d.get("next_page")
+        d = prov.get_json(nxt[len(prov.base):]) if nxt else None
+    return out
+
+
+def download_names(langs, progress=lambda label, done, total: None):
+    """Fetch printed names for the chosen languages into LOCAL_NAMES_FILE."""
+    langs = [l for l in dict.fromkeys(langs or []) if l in NAME_LANGS]
+    prov = provider_for("mtg")
+    names = _fetch_names(prov, "is:flavorname", "en", progress, "flavor")
+    for lang in langs:
+        names += _fetch_names(prov, "lang:" + lang, lang, progress, lang)
+    tmp = LOCAL_NAMES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"downloaded_at": now_iso(), "langs": langs, "names": names},
+                  f, ensure_ascii=False)
+    os.replace(tmp, LOCAL_NAMES_FILE)
+    _names.clear()
+    return len(names)
 
 
 def local_meta(game="mtg"):
@@ -1780,12 +1892,31 @@ def names_agree(a, b):
     return na in nb or nb in na or _similar(na, nb) > 0.7
 
 
+def title_agrees(title, card, lang=None):
+    """The OCR'd title is this card's name, in English or as printed.
+
+    Printed names are those of the language read on the card's bottom line
+    (all downloaded languages when it wasn't read), plus flavor names.
+    """
+    if names_agree(title, card["name"]):
+        return True
+    code = clean_lang(lang, "") if lang else ""
+    printed = printed_names(card.get("set_code"), card.get("collector_number"),
+                            code or None)
+    if code and code != "en":
+        printed.update(printed_names(card.get("set_code"),
+                                     card.get("collector_number"), "en"))
+    if code and not printed:  # that language's names aren't downloaded
+        printed = printed_names(card.get("set_code"), card.get("collector_number"))
+    return any(names_agree(title, n) for n in printed.values())
+
+
 def title_contradicts(title, card, game="mtg"):
     """True when the OCR'd title clearly names another card.
 
     Set + number decide the printing; the title only vetoes it. A title that
-    is unreadable, or in a language the offline index doesn't know (e.g. a
-    French card), matches no card name and so doesn't block anything.
+    is unreadable, or in a language whose printed names aren't downloaded,
+    matches no card name and so doesn't block anything.
     """
     other = local_name_match(title, game)
     return other is not None and not names_agree(other["name"], card["name"])
@@ -1852,7 +1983,7 @@ def identify_card(image_path, game="mtg"):
                 card = None
             if card:
                 method, source = "exact", "api"
-        if card and (not names or names_agree(names[0], card["name"])
+        if card and (not names or title_agrees(names[0], card, lang)
                      or (game == "mtg" and not title_contradicts(names[0], card, game))):
             return {"match": card, "method": method, "source": source,
                     "exact": True,
@@ -3341,7 +3472,9 @@ class Handler(BaseHTTPRequestHandler):
             "card_count": (meta or {}).get("card_count", 0),
             "downloaded_at": (meta or {}).get("downloaded_at"),
             "downloading": downloading, "phase": phase,
-            "done_mb": done_mb, "total_mb": total_mb, "cards": cards})
+            "done_mb": done_mb, "total_mb": total_mb, "cards": cards,
+            "name_langs": list(NAME_LANGS) if game == "mtg" else [],
+            "langs": _load_names()["langs"] if game == "mtg" else []})
 
     def api_localdb_download(self):
         game = self.game_param()
@@ -3349,7 +3482,12 @@ class Handler(BaseHTTPRequestHandler):
             if _download_state_for(game)["active"]:
                 self.send_json({"error": "download already running"}, 409)
                 return
-        download_localdb(game)
+        try:
+            body = json.loads(self.read_body() or b"{}")
+        except ValueError:
+            body = {}
+        langs = body.get("langs") if isinstance(body, dict) else None
+        download_localdb(game, langs if isinstance(langs, list) else None)
         self.send_json({"ok": True, "started": True})
 
 
