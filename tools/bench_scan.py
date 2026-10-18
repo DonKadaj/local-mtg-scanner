@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime
 
@@ -32,13 +33,29 @@ sys.path.insert(0, ROOT)
 import server  # noqa: E402
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png")
-FIELDS = ["file", "set", "number", "lang", "foil", "name", "title_read", "note"]
+FIELDS = ["file", "set", "number", "lang", "foil", "name", "title", "title_read", "note"]
 VERDICTS = [
     ("exact", "exact print (right set + number)"),
     ("name", "right card, wrong or unknown printing"),
     ("wrong", "wrong card"),
     ("none", "no match"),
 ]
+
+
+def fold(text):
+    """Letters only, no accents, lowercase: how titles are compared."""
+    text = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch for ch in text.lower() if ch.isalpha())
+
+
+def title_verdict(read, truth):
+    """"ok" (same letters), "close" (a typo or two) or "bad"."""
+    a, b = fold(read), fold(truth)
+    if not b:
+        return ""
+    if a == b:
+        return "ok"
+    return "close" if a and server._similar(a, b) >= 0.8 else "bad"
 
 
 def sniff_delimiter(path):
@@ -177,7 +194,9 @@ def run_bench(folder, labels_path, offline):
             "verdict": verdict,
             "matched": "%s #%s %s" % (got_set.upper(), got_num, m.get("name", "")) if m else "",
             "method": res.get("method") or "",
+            "title": r.get("title", ""),
             "title_read": res.get("ocr_guess") or "",
+            "title_ok": title_verdict(res.get("ocr_guess"), r.get("title")),
             "set_read": read_set or "",
             "number_read": read_num or "",
             "bottom_line_ok": "yes" if bottom_ok else "no",
@@ -196,6 +215,11 @@ def run_bench(folder, labels_path, offline):
         print("%-6s %3d  %5.1f%%  %s" % (key, counts[key], 100.0 * counts[key] / n, label))
     ok_bottom = sum(1 for o in out if o["bottom_line_ok"] == "yes")
     print("bottom line read correctly: %d/%d" % (ok_bottom, n))
+    titled = [o for o in out if o["title_ok"]]
+    if titled:
+        tc = Counter(o["title_ok"] for o in titled)
+        print("title read: %d/%d exact · %d close (1-2 typos)" % (
+            tc["ok"], len(titled), tc["close"]))
     for kind in ("lang", "foil"):
         subs = sorted((v, c) for (k, v), c in groups.items() if k == kind)
         if len(subs) < 2:
