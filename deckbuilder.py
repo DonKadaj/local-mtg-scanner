@@ -1103,7 +1103,7 @@ def api_deck_add_to_collection(self, deck_id):
             foil = r["foil"]
             qty = r["quantity"]
             existing = conn.execute(
-                "SELECT id FROM cards WHERE scryfall_id=? AND foil=?",
+                "SELECT id FROM cards WHERE scryfall_id=? AND foil=? AND lang='en'",
                 (sid, foil)).fetchone()
             if existing:
                 conn.execute("UPDATE cards SET quantity=quantity+? WHERE id=?",
@@ -1175,7 +1175,7 @@ def api_collection_import_decklist(self):
         for s, qty in resolved:
             sid = s["scryfall_id"]
             existing = conn.execute(
-                "SELECT id FROM cards WHERE scryfall_id=? AND foil=0",
+                "SELECT id FROM cards WHERE scryfall_id=? AND foil=0 AND lang='en'",
                 (sid,)).fetchone()
             if existing:
                 conn.execute("UPDATE cards SET quantity=quantity+? WHERE id=?",

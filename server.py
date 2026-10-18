@@ -156,7 +156,8 @@ def init_db():
                 price_usd_foil REAL,
                 price_updated_at TEXT,
                 added_at TEXT NOT NULL,
-                UNIQUE (scryfall_id, foil)
+                lang TEXT NOT NULL DEFAULT 'en',
+                UNIQUE (scryfall_id, foil, lang)
             );
             CREATE TABLE IF NOT EXISTS price_history (
                 id INTEGER PRIMARY KEY,
@@ -208,6 +209,22 @@ def init_db():
         if "for_sale" not in cols:
             conn.execute(
                 "ALTER TABLE cards ADD COLUMN for_sale INTEGER NOT NULL DEFAULT 0")
+        if "lang" not in cols:
+            # printed language of the copy: a French and an English copy of
+            # the same printing are separate rows. SQLite can't change a
+            # UNIQUE constraint in place, so the table is rebuilt.
+            backup_db()
+            conn.execute("ALTER TABLE cards ADD COLUMN lang TEXT NOT NULL DEFAULT 'en'")
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='cards'"
+            ).fetchone()[0]
+            sql = re.sub(r"UNIQUE\s*\(\s*scryfall_id\s*,\s*foil\s*\)",
+                         "UNIQUE (scryfall_id, foil, lang)", sql)
+            sql = re.sub(r"^CREATE TABLE \"?cards\"?", "CREATE TABLE cards_new", sql)
+            conn.execute(sql)
+            conn.execute("INSERT INTO cards_new SELECT * FROM cards")
+            conn.execute("DROP TABLE cards")
+            conn.execute("ALTER TABLE cards_new RENAME TO cards")
         wcols = [r[1] for r in conn.execute("PRAGMA table_info(wishlist)")]
         if "game" not in wcols:
             conn.execute(
@@ -1724,6 +1741,21 @@ def _similar(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+# Language code printed on the card ("HOB • FR") -> Scryfall language code.
+PRINTED_LANGS = {"EN": "en", "FR": "fr", "DE": "de", "IT": "it", "ES": "es",
+                 "SP": "es", "PT": "pt", "JA": "ja", "JP": "ja", "KO": "ko",
+                 "KR": "ko", "RU": "ru", "ZH": "zhs", "CS": "zhs", "CT": "zht",
+                 "PH": "ph"}
+CARD_LANGS = sorted(set(PRINTED_LANGS.values()))
+
+
+def clean_lang(value, default="en"):
+    """A copy's language as a Scryfall code; unknown values give default."""
+    v = (value or "").strip()
+    v = PRINTED_LANGS.get(v.upper(), v.lower())
+    return v if v in CARD_LANGS else default
+
+
 def identify_card(image_path, game="mtg"):
     """Match an OCR'd card: local DB first (fast/offline), then the API."""
     prov = provider_for(game)
@@ -2318,6 +2350,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             os.unlink(tmp)
         if result.get("match"):
+            # the language printed on the card travels with the match, so
+            # every "add" from the scanner stores it (copy: the match may be
+            # a cached index entry)
+            lang = (result.get("read") or {}).get("lang")
+            if lang:
+                result["match"] = dict(result["match"], lang=clean_lang(lang))
             sid = result["match"]["scryfall_id"]
             now = time.time()
             with _last_scan_lock:
@@ -2351,12 +2389,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "card not found"}, 404)
                 return
             s = provider_for(game).summary(card)
+        lang = clean_lang(body.get("lang") or (card or {}).get("lang"))
         ts = now_iso()
         wl_match = None
         with db_lock, db() as conn:
             existing = conn.execute(
-                "SELECT id, quantity FROM cards WHERE scryfall_id=? AND foil=? AND game=?",
-                (sid, foil, game)).fetchone()
+                "SELECT id, quantity FROM cards WHERE scryfall_id=? AND foil=? "
+                "AND lang=? AND game=?",
+                (sid, foil, lang, game)).fetchone()
             if existing:
                 conn.execute("UPDATE cards SET quantity=?, price_usd=?, "
                              "price_usd_foil=?, price_updated_at=?, back_image_uri=? "
@@ -2370,13 +2410,14 @@ class Handler(BaseHTTPRequestHandler):
                        collector_number, rarity, mana_cost, type_line, colors,
                        image_uri, scryfall_uri, back_image_uri, foil, quantity,
                        price_usd, price_usd_foil, price_updated_at, added_at,
-                       condition, game)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       condition, game, lang)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (sid, s["name"], s["set_code"], s["set_name"],
                      s["collector_number"], s["rarity"], s["mana_cost"],
                      s["type_line"], s["colors"], s["image_uri"],
                      s["scryfall_uri"], s.get("back_image_uri"), foil, qty,
-                     s["price_usd"], s["price_usd_foil"], ts, ts, cond, game))
+                     s["price_usd"], s["price_usd_foil"], ts, ts, cond, game,
+                     lang))
             conn.execute(
                 "INSERT INTO price_history (scryfall_id, recorded_at, usd, usd_foil) "
                 "VALUES (?,?,?,?)", (sid, ts, s["price_usd"], s["price_usd_foil"]))
@@ -2428,11 +2469,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             target_sid = new_sid or row["scryfall_id"]
             target_foil = 1 if body.get("foil") else row["foil"]
+            target_lang = clean_lang(body.get("lang"), row["lang"])
             merged = False
-            if target_sid != row["scryfall_id"] or target_foil != row["foil"]:
+            if (target_sid != row["scryfall_id"] or target_foil != row["foil"]
+                    or target_lang != row["lang"]):
                 clash = conn.execute(
-                    "SELECT id FROM cards WHERE scryfall_id=? AND foil=? AND game=? AND id<>?",
-                    (target_sid, target_foil, row["game"], card_id)).fetchone()
+                    "SELECT id FROM cards WHERE scryfall_id=? AND foil=? AND lang=? "
+                    "AND game=? AND id<>?",
+                    (target_sid, target_foil, target_lang, row["game"],
+                     card_id)).fetchone()
                 if clash:
                     conn.execute("UPDATE cards SET quantity=quantity+? WHERE id=?",
                                  (row["quantity"], clash["id"]))
@@ -2451,9 +2496,9 @@ class Handler(BaseHTTPRequestHandler):
                          s["scryfall_uri"], s.get("back_image_uri"),
                          s["price_usd"], s["price_usd_foil"],
                          now_iso(), card_id))
-                else:
-                    conn.execute("UPDATE cards SET foil=? WHERE id=?",
-                                 (target_foil, card_id))
+                if not merged:
+                    conn.execute("UPDATE cards SET foil=?, lang=? WHERE id=?",
+                                 (target_foil, target_lang, card_id))
             if not merged and "quantity" in body:
                 qty = int(body["quantity"])
                 if qty <= 0:
@@ -2709,7 +2754,8 @@ class Handler(BaseHTTPRequestHandler):
                          "back_image_uri": None}
                 ts = now_iso()
                 existing = conn.execute(
-                    "SELECT id, quantity FROM cards WHERE scryfall_id=? AND foil=? AND game=?",
+                    "SELECT id, quantity FROM cards WHERE scryfall_id=? AND foil=? "
+                    "AND lang='en' AND game=?",
                     (row["scryfall_id"], 0, game)).fetchone()
                 if existing:
                     conn.execute("UPDATE cards SET quantity=?, price_usd=?, "
@@ -3022,7 +3068,7 @@ class Handler(BaseHTTPRequestHandler):
         fields = ["scryfall_id", "name", "set_code", "set_name",
                   "collector_number", "rarity", "foil", "quantity",
                   "condition", "purchase_price", "for_trade", "for_sale",
-                  "price_usd", "price_usd_foil", "added_at", "game"]
+                  "price_usd", "price_usd_foil", "added_at", "game", "lang"]
         buf = io.StringIO()
         w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -3040,7 +3086,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_import(self):
         """CSV import (header: scryfall_id, name, set_code, collector_number,
-        foil, quantity; a plain list of card names also works).
+        foil, quantity, lang; a plain list of card names also works).
         """
         game = self.game_param()
         prov = provider_for(game)
@@ -3094,6 +3140,7 @@ class Handler(BaseHTTPRequestHandler):
                 "1", "true", "yes", "y") else 0
             sale = 1 if str(r.get("for_sale", "")).strip().lower() in (
                 "1", "true", "yes", "y") else 0
+            lang = clean_lang(r.get("lang"))
             s = summary_map.get(sid)
             if s is None and sid:
                 card = fetch_card(sid, row_game)
@@ -3122,15 +3169,16 @@ class Handler(BaseHTTPRequestHandler):
             if s is None:
                 errors.append(name or sid or "?")
                 continue
-            resolved.append((s, foil, qty, cond, pp, trade, sale, row_game))
+            resolved.append((s, foil, qty, cond, pp, trade, sale, row_game, lang))
 
         added = updated = 0
         ts = now_iso()
         with db_lock, db() as conn:
-            for s, foil, qty, cond, pp, trade, sale, row_game in resolved:
+            for s, foil, qty, cond, pp, trade, sale, row_game, lang in resolved:
                 existing = conn.execute(
-                    "SELECT id FROM cards WHERE scryfall_id=? AND foil=? AND game=?",
-                    (s["scryfall_id"], foil, row_game)).fetchone()
+                    "SELECT id FROM cards WHERE scryfall_id=? AND foil=? AND lang=? "
+                    "AND game=?",
+                    (s["scryfall_id"], foil, lang, row_game)).fetchone()
                 if existing:
                     conn.execute(
                         "UPDATE cards SET quantity=quantity+?, price_usd=?, "
@@ -3147,15 +3195,15 @@ class Handler(BaseHTTPRequestHandler):
                            type_line, colors, image_uri, scryfall_uri,
                            back_image_uri, foil, quantity, price_usd,
                            price_usd_foil, price_updated_at, added_at, condition,
-                           purchase_price, for_trade, for_sale, game)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           purchase_price, for_trade, for_sale, game, lang)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (s["scryfall_id"], s["name"], s["set_code"],
                          s["set_name"], s["collector_number"], s["rarity"],
                          s["mana_cost"], s["type_line"], s["colors"],
                          s["image_uri"], s["scryfall_uri"],
                          s.get("back_image_uri"), foil, qty, s["price_usd"],
                          s["price_usd_foil"], ts, ts, cond, pp, trade, sale,
-                         row_game))
+                         row_game, lang))
                     added += 1
         backup_db()
         broadcast({"type": "library-changed"})

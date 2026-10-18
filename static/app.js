@@ -181,6 +181,8 @@ const COLOR_NAME = { W: "White", U: "Blue", B: "Black", R: "Red", G: "Green" };
 const COND_NAME = { NM: "Near Mint", LP: "Lightly Played", MP: "Moderately Played", HP: "Heavily Played", D: "Damaged" };
 // matches server COND_MULT — used only to label condition-adjusted prices
 const COND_MULT = { NM: 1, LP: .9, MP: .8, HP: .6, D: .4 };
+// Printed language of a copy (Scryfall code) as shown on the card: "FR".
+function langTag(lang) { return (lang || "en").toUpperCase(); }
 function condMult(c) { return COND_MULT[c.condition || "NM"] ?? 1; }
 
 function updateStats() {
@@ -301,7 +303,8 @@ function showMatch(card, method) {
     $("result-name").appendChild(badge);
   }
   $("result-set").textContent =
-    `${card.set_name} (${(card.set_code || "").toUpperCase()}) · #${card.collector_number} · ${card.rarity}`;
+    `${card.set_name} (${(card.set_code || "").toUpperCase()}) · #${card.collector_number} · ${card.rarity}` +
+    (card.lang ? ` · ${langTag(card.lang)}` : "");
   updatePriceLine();
   $("scan-result").classList.remove("hidden");
   if (!liveActive) $("scan-result").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -523,7 +526,8 @@ function handleLiveResult(data) {
     thumb.src = imgUrl(data.match.image_uri || "");
     thumb.classList.remove("hidden");
     $("scan-meta").textContent =
-      `${data.match.price_usd != null ? "$" + data.match.price_usd.toFixed(2) : "—"} · ${(data.match.set_code || "?").toUpperCase()} #${data.match.collector_number || "?"}`;
+      `${data.match.price_usd != null ? "$" + data.match.price_usd.toFixed(2) : "—"} · ${(data.match.set_code || "?").toUpperCase()} #${data.match.collector_number || "?"}` +
+      (data.match.lang ? ` · ${langTag(data.match.lang)}` : "");
     $("scan-match").classList.remove("hidden");
     overlay.textContent = `${data.match.name}${note}`;
     overlay.classList.add("matched");
@@ -838,6 +842,7 @@ function tileMarkup(c) {
   const badges = [];
   if (c.foil) badges.push(`<span class="badge foil">FOIL</span>`);
   if (c.quantity > 1) badges.push(`<span class="badge">×${c.quantity}</span>`);
+  if (c.lang && c.lang !== "en") badges.push(`<span class="badge">${langTag(c.lang)}</span>`);
   if (c.condition && c.condition !== "NM")
     badges.push(`<span class="cond" title="${COND_NAME[c.condition] || c.condition}">${c.condition}</span>`);
   if (c.for_trade) badges.push(`<span class="badge trade">TRADE</span>`);
@@ -905,7 +910,7 @@ function renderLedger(cards, parent) {
       (c.for_trade ? `<span class="flag-tag trade">TRADE</span>` : "") +
       (c.for_sale ? `<span class="flag-tag sale">SELL</span>` : "") +
       `<span class="gem ${c.rarity || "common"}"></span></span>` +
-      `<span class="num">${esc((c.set_code || "").toUpperCase())} #${esc(c.collector_number || "?")}</span>` +
+      `<span class="num">${esc((c.set_code || "").toUpperCase())} #${esc(c.collector_number || "?")} · ${langTag(c.lang)}</span>` +
       `<span class="qty-cell">×${c.quantity}</span>` +
       `<span class="finish-cell">${c.foil ? "Foil" : "—"}</span>` +
       `<span class="cond-cell">${c.condition || "NM"}</span>` +
@@ -1195,6 +1200,7 @@ function openDetail(card) {
     ((card.condition || "NM") !== "NM" ? ` · ${COND_NAME[card.condition] || card.condition}` : "");
   $("detail-foil").checked = !!card.foil;
   $("detail-condition").value = card.condition || "NM";
+  $("detail-lang").value = card.lang || "en";
   $("detail-qty").textContent = card.quantity || 1;
   $("detail-paid").value = card.purchase_price != null ? card.purchase_price : "";
   $("detail-trade").checked = !!card.for_trade;
@@ -1254,6 +1260,7 @@ $("detail-save").onclick = async () => {
   const paid = $("detail-paid").value;
   const body = { id: detailCard.id, foil: $("detail-foil").checked,
                  condition: $("detail-condition").value,
+                 lang: $("detail-lang").value,
                  purchase_price: paid === "" ? null : paid,
                  for_trade: $("detail-trade").checked,
                  for_sale: $("detail-sale").checked };
