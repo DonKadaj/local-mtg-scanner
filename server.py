@@ -1535,11 +1535,28 @@ def api_img(self, url):
 #   • Apple Vision (macOS) — the ocr.swift helper, best quality, auto-built
 #     with swiftc on first run.
 #   • Tesseract (any OS) — `tesseract` on PATH (brew/apt/choco install
-#     tesseract). Language packs via CARD_TRACKER_TESS_LANGS (default "eng").
+#     tesseract). Language packs via CARD_TRACKER_TESS_LANGS (default "eng"
+#     plus the installed packs of other Latin-script card languages).
 # Both are normalized to the same line format: {text, confidence 0..1,
 # x, y, w, h} with normalized coordinates and a bottom-left origin.
 
-TESS_LANGS = os.environ.get("CARD_TRACKER_TESS_LANGS", "eng")
+# Tesseract packs for card languages written in the Latin alphabet. With
+# "eng+fra", French cards read better: accents in titles, and the corner
+# line too (test set: 11 → 14/18 exact prints).
+EXTRA_TESS_LANGS = ("fra", "deu", "ita", "spa", "por")
+
+
+def _default_tess_langs():
+    try:
+        out = subprocess.run(["tesseract", "--list-langs"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "eng"
+    installed = {ln.strip() for ln in out.splitlines()}
+    return "+".join(["eng"] + [l for l in EXTRA_TESS_LANGS if l in installed])
+
+
+TESS_LANGS = os.environ.get("CARD_TRACKER_TESS_LANGS") or _default_tess_langs()
 _ocr_backend = None
 
 

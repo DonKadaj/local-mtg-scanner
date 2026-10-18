@@ -82,6 +82,12 @@ photos, and it reads iPhone HEIC natively. Everywhere else (or if the build
 fails) it falls back to Tesseract automatically. The startup banner tells you
 which OCR backend and URLs are active.
 
+Non-English Magic cards: install the Tesseract pack for their language
+(e.g. `fra.traineddata` from [tessdata_fast](https://github.com/tesseract-ocr/tessdata_fast)
+into Tesseract's `tessdata` folder, or `sudo apt install tesseract-ocr-fra`).
+Installed French, German, Italian, Spanish and Portuguese packs are used
+automatically alongside English.
+
 ## Run it
 
 ```bash
@@ -104,7 +110,9 @@ Configuration is via environment variables (all optional):
 ```bash
 CARD_TRACKER_PORT=8484                    # HTTP
 CARD_TRACKER_TLS_PORT=8485                # HTTPS (live camera)
-CARD_TRACKER_TESS_LANGS=eng               # Tesseract language packs
+CARD_TRACKER_TESS_LANGS=eng+fra           # Tesseract language packs
+                                          # (default: eng + installed
+                                          # fra/deu/ita/spa/por)
 POKEMON_TCG_API_KEY=...                   # optional — raises the
                                           # pokemontcg.io price limit to
                                           # 20,000 requests/day
