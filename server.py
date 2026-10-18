@@ -1876,11 +1876,57 @@ def _mark_refreshed():
     _meta_set("last_auto_refresh", str(time.time()))
 
 
+def english_print(sid, set_code, number, game="mtg"):
+    """English printing (same set + number) of a non-English Magic printing.
+
+    Scryfall rarely prices non-English printings, so a French copy is priced
+    by its English printing. None for an English printing (it is in the
+    offline index) or when the offline index isn't there.
+    """
+    if game != "mtg" or not set_code or not number:
+        return None
+    if local_by_sid(sid, game) is not None:
+        return None
+    en = local_exact_match(set_code, number, game)
+    return en if en and en["scryfall_id"] != sid else None
+
+
+def fill_english_price(s, game="mtg"):
+    """Give an unpriced non-English summary its English printing's prices."""
+    if s.get("price_usd") is not None or s.get("price_usd_foil") is not None:
+        return s
+    en = english_print(s.get("scryfall_id"), s.get("set_code"),
+                       s.get("collector_number"), game)
+    if en:
+        s["price_usd"], s["price_usd_foil"] = en.get("price_usd"), en.get("price_usd_foil")
+    return s
+
+
+def _price_sources(ids, game):
+    """{scryfall_id: id to fetch prices from} for non-English printings."""
+    if game != "mtg":
+        return {}
+    with db_lock, db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT scryfall_id, set_code, collector_number FROM cards "
+            "WHERE game=?", (game,)).fetchall()
+    wanted = set(ids)
+    src = {}
+    for r in rows:
+        if r["scryfall_id"] in wanted:
+            en = english_print(r["scryfall_id"], r["set_code"],
+                               r["collector_number"], game)
+            if en:
+                src[r["scryfall_id"]] = en["scryfall_id"]
+    return src
+
+
 def _refresh_cards(ids, ts, game):
     prov = provider_for(game)
+    src = _price_sources(ids, game)
     bulk = None
     try:
-        bulk = prov.fresh_prices(ids)
+        bulk = prov.fresh_prices(list(dict.fromkeys(src.get(s, s) for s in ids)))
     except Exception:
         bulk = None
     use_bulk = bulk is not None
@@ -1889,13 +1935,13 @@ def _refresh_cards(ids, ts, game):
     for i, sid in enumerate(ids, 1):
         usd = fld = None
         if use_bulk:
-            pv = bulk.get(sid)
+            pv = bulk.get(src.get(sid, sid))
             if not pv:
                 continue
             usd, fld = pv[0], pv[1]
         else:
             try:
-                card = prov.get_card(sid)
+                card = prov.get_card(src.get(sid, sid))
             except Exception:
                 card = None
             if not card:
@@ -2390,6 +2436,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             s = provider_for(game).summary(card)
         lang = clean_lang(body.get("lang") or (card or {}).get("lang"))
+        fill_english_price(s, game)
         ts = now_iso()
         wl_match = None
         with db_lock, db() as conn:
@@ -2461,6 +2508,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             s = provider_for(game).summary(card)
             new_sid = s["scryfall_id"]
+        if s:
+            fill_english_price(s, game)
 
         with db_lock, db() as conn:
             row = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
@@ -3169,6 +3218,7 @@ class Handler(BaseHTTPRequestHandler):
             if s is None:
                 errors.append(name or sid or "?")
                 continue
+            fill_english_price(s, row_game)
             resolved.append((s, foil, qty, cond, pp, trade, sale, row_game, lang))
 
         added = updated = 0
