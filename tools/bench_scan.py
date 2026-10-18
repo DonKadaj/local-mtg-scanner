@@ -162,6 +162,8 @@ def run_bench(folder, labels_path, offline):
             res, err = {}, str(e)
         secs = time.time() - t0
         lines = last.get("lines") or []
+        # the title actually read (ocr_guess falls back to the matched name)
+        title_read = (res.get("ocr_candidates") or [""])[0]
         read = res.get("read")  # what the server read (incl. the corner reader)
         if read is not None:
             read_set, read_num = read.get("set"), read.get("number")
@@ -195,8 +197,8 @@ def run_bench(folder, labels_path, offline):
             "matched": "%s #%s %s" % (got_set.upper(), got_num, m.get("name", "")) if m else "",
             "method": res.get("method") or "",
             "title": r.get("title", ""),
-            "title_read": res.get("ocr_guess") or "",
-            "title_ok": title_verdict(res.get("ocr_guess"), r.get("title")),
+            "title_read": title_read,
+            "title_ok": title_verdict(title_read, r.get("title")),
             "set_read": read_set or "",
             "number_read": read_num or "",
             "bottom_line_ok": "yes" if bottom_ok else "no",
@@ -205,7 +207,7 @@ def run_bench(folder, labels_path, offline):
         })
         print("%-5s %-28s %-8s read: %s #%s · title: %s" % (
             verdict, r["file"][:28], out[-1]["method"],
-            (read_set or "-").upper(), read_num or "-", (res.get("ocr_guess") or "-")[:30]))
+            (read_set or "-").upper(), read_num or "-", (title_read or "-")[:30]))
 
     n = len(out)
     if not n:
