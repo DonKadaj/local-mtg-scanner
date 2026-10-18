@@ -1668,9 +1668,14 @@ def clean_title(text):
     Tesseract often adds stray symbols before or after the title ("| Gardienne
     des salles |", "Gros ours 3"). Non-letters are trimmed at both
     ends; accents, apostrophes, hyphens and commas inside are kept
-    ("L'Anneau unique", "Jace, ..."). Leftover one-letter words at the end
-    are mana or frame noise.
+    ("L'Anneau unique", "Jace, ..."). Leftover words at the end that are
+    one letter, two capitals or hold symbols are mana or frame noise
+    ("Baton de sorcier \\L\\e DE").
     """
+    def noise(word):
+        return (len(word) == 1 or (len(word) <= 2 and word.isupper())
+                or any(not (ch.isalpha() or ch in "'-,.") for ch in word))
+
     text = re.sub(r"\s+", " ", (text or "").replace("’", "'"))
     start, end = 0, len(text)
     while start < end and not text[start].isalpha():
@@ -1679,7 +1684,7 @@ def clean_title(text):
         end -= 1
     text = text[start:end]
     words = text.split(" ")
-    while len(words) > 1 and len(words[-1]) == 1:
+    while len(words) > 1 and noise(words[-1]):
         words.pop()
     text = " ".join(words).rstrip(" ,'-")
     return text if sum(ch.isalpha() for ch in text) >= 2 else ""
@@ -1689,10 +1694,14 @@ def candidate_names(lines):
     """Pick likely card-name lines: topmost text, mostly letters.
 
     Vision bounding boxes have a bottom-left origin, so the card title is
-    the line with the highest y.
+    the line with the highest y. The bottom quarter of the photo (collector
+    line, artist, copyright) never holds the title: when the title itself
+    isn't read, "FCA • EN" must not stand in for it.
     """
     usable = []
     for ln in lines:
+        if ln["y"] < 0.25:
+            continue
         text = ln["text"].strip()
         letters = sum(ch.isalpha() for ch in text)
         if len(text) < 3 or len(text) > 40:
